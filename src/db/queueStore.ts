@@ -8,6 +8,7 @@ export interface QueueState {
   history: Track[];
   loop: LoopMode;
   volume: number;
+  playerStatus?: string;
   paused: boolean;
   lastTextChannelId: string | null;
   voiceChannelId: string | null;

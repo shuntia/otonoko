@@ -5,6 +5,7 @@ import { handleInteraction, registerCommands } from "./commands/index.js";
 import { initSchema } from "./db/playlistStore.js";
 import { initCacheSchema } from "./db/cacheStore.js";
 import { initQueueSchema } from "./db/queueStore.js";
+import { initGuildSettingsSchema } from "./db/guildSettingsStore.js";
 import { startCachePruner } from "./db/cachePruner.js";
 import { setupVoiceWatchers } from "./voice/watchers.js";
 import { handleChatActivity, handleMessageDelete, handleMessageUpdate } from "./status/statusManager.js";
@@ -17,16 +18,18 @@ const client = new Client({
   partials: [Partials.Channel],
 });
 
-client.once("ready", async () => {
+client.once("clientReady", async () => {
   log.info(`Ready as ${client.user?.tag ?? "unknown"}`);
   await initSchema();
   await initCacheSchema();
   await initQueueSchema();
+  await initGuildSettingsSchema();
   startCachePruner();
   attachStatusClient(client);
   await registerCommands(client);
   setupVoiceWatchers(client);
   statsTracker.start(client);
+  await musicManager.restoreGuildVolumes();
   await musicManager.restore(client);
 });
 

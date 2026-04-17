@@ -1,6 +1,7 @@
 import { SlashCommandBuilder, EmbedBuilder, version as djsVersion } from "discord.js";
 import { SlashCommand } from "./types.js";
 import { musicManager } from "../music/manager.js";
+import { getPlaybackElapsedMs } from "../music/playbackPosition.js";
 import { formatDuration } from "../utils/format.js";
 
 export const debugCommand: SlashCommand = {
@@ -30,7 +31,7 @@ export const debugCommand: SlashCommand = {
       );
 
     if (state.current) {
-      const elapsed = state.currentStartedAt ? Date.now() - state.currentStartedAt : 0;
+      const elapsed = getPlaybackElapsedMs(state);
       embed.addFields({ 
         name: "Current Track", 
         value: `Title: ${state.current.title}\nURL: ${state.current.url}\nPosition: ${formatDuration(elapsed)} / ${formatDuration(state.current.durationMs)}`,

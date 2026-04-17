@@ -2,6 +2,7 @@ import { AudioPlayer, AudioPlayerStatus, createAudioPlayer, VoiceConnection, joi
 import PQueue from "p-queue";
 import { Queue } from "./queue.js";
 import { saveQueueState, clearQueueState, listAllQueueStates } from "../db/queueStore.js";
+import { listAllGuildVolumes, saveGuildVolume } from "../db/guildSettingsStore.js";
 import { Client } from "discord.js";
 import { log } from "../logger.js";
 import crypto from "crypto";
@@ -32,6 +33,8 @@ export interface GuildMusicState {
   queue: Queue;
   current: Track | null;
   currentStartedAt: number | null;
+  pausedAt: number | null;
+  playbackBaseOffsetMs: number;
   history: Track[];
   loop: LoopMode;
   filters: AudioFilters;
@@ -49,6 +52,7 @@ export interface GuildMusicState {
 
 export class MusicManager {
   private states = new Map<string, GuildMusicState>();
+  private volumeByGuild = new Map<string, number>();
 
   get(guildId: string): GuildMusicState {
     const existing = this.states.get(guildId);
@@ -59,10 +63,12 @@ export class MusicManager {
       queue: new Queue(),
       current: null,
       currentStartedAt: null,
+      pausedAt: null,
+      playbackBaseOffsetMs: 0,
       history: [],
       loop: "off",
       filters: {},
-      volume: 1,
+      volume: this.volumeByGuild.get(guildId) ?? 1,
       taskQueue: new PQueue({ concurrency: 1 }),
       idleTimeout: null,
       lastTextChannelId: null,
@@ -80,6 +86,8 @@ export class MusicManager {
   async saveState(guildId: string) {
     const state = this.states.get(guildId);
     if (!state) return;
+    this.volumeByGuild.set(guildId, state.volume);
+    await saveGuildVolume(guildId, state.volume);
     
     // Don't save if empty and idle
     if (!state.current && state.queue.length === 0) {
@@ -94,10 +102,18 @@ export class MusicManager {
       history: state.history,
       loop: state.loop,
       volume: state.volume,
+      playerStatus: state.player.state.status,
       paused: state.player.state.status === AudioPlayerStatus.Paused,
       lastTextChannelId: state.lastTextChannelId,
       voiceChannelId: state.connection?.joinConfig.channelId ?? null,
     });
+  }
+
+  async restoreGuildVolumes() {
+    const rows = await listAllGuildVolumes();
+    for (const row of rows) {
+      this.volumeByGuild.set(row.guildId, row.volume);
+    }
   }
 
   async restore(client: Client) {
@@ -113,12 +129,35 @@ export class MusicManager {
         }
 
         const state = this.get(data.guildId);
-        state.current = data.current;
         state.queue.enqueueMany(data.queue);
         state.history = data.history;
         state.loop = data.loop;
         state.volume = data.volume;
+        this.volumeByGuild.set(data.guildId, data.volume);
+        await saveGuildVolume(data.guildId, data.volume);
         state.lastTextChannelId = data.lastTextChannelId;
+
+        const savedStatus = data.playerStatus ?? AudioPlayerStatus.Idle;
+        const shouldResumeCurrent =
+          !!data.current &&
+          (savedStatus === AudioPlayerStatus.Playing || savedStatus === AudioPlayerStatus.Buffering);
+
+        if (shouldResumeCurrent && data.current) {
+          const currentTrack = data.current;
+          const currentIdx = state.queue.all.findIndex(
+            (track) =>
+              (currentTrack.id && track.id === currentTrack.id) ||
+              track.url === currentTrack.url,
+          );
+          if (currentIdx === -1) {
+            state.queue.unshift(currentTrack);
+          } else {
+            state.queue.index = currentIdx - 1;
+          }
+          state.current = currentTrack;
+        } else {
+          state.current = null;
+        }
 
         if (data.voiceChannelId) {
           const channel = await guild.channels.fetch(data.voiceChannelId).catch(() => null);
@@ -131,15 +170,10 @@ export class MusicManager {
             });
             state.connection.subscribe(state.player);
             
-            // Resume playback if we had a track
-            if (state.current) {
-               const { playNext } = await import("./controller.js");
-               // We need to play. If it was paused, playNext will start it playing, then we pause?
-               // Or we just playNext.
-               await playNext(guild.id);
-               // If it was paused in state, we should pause it after a bit? 
-               // For simplicity, let's just start playing.
-            }
+            if (shouldResumeCurrent && state.current) {
+              const { playNext } = await import("./controller.js");
+              await playNext(guild.id);
+             }
           }
         }
       } catch (err) {
@@ -190,6 +224,8 @@ export class MusicManager {
         state.connection = null;
       }
     }
+    this.volumeByGuild.set(guildId, state.volume);
+    void saveGuildVolume(guildId, state.volume);
     this.clearState(guildId);
     void clearQueueState(guildId);
     // Detach from channel (stop session)

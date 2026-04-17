@@ -62,7 +62,6 @@ export const commands: SlashCommand[] = [
 ];
 
 export async function registerCommands(client: Client<true> | Client) {
-  const readyClient = client instanceof Client && client.isReady() ? client : null;
   const rest = new REST({ version: "10" }).setToken(env.DISCORD_TOKEN);
   const targetGuild = env.GUILD_ID;
   const commandData = commands.map((cmd) => cmd.data.toJSON());
@@ -75,9 +74,6 @@ export async function registerCommands(client: Client<true> | Client) {
       const route = Routes.applicationCommands(env.CLIENT_ID);
       await rest.put(route, { body: commandData });
       log.info(`Registered ${commandData.length} global commands`);
-    }
-    if (readyClient) {
-      readyClient.user?.setPresence({ activities: [{ name: "bootstrapping otonoko" }] });
     }
   } catch (err) {
     log.error("Failed to register commands", err);

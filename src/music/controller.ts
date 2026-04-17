@@ -3,7 +3,9 @@ import { GuildMember, VoiceBasedChannel } from "discord.js";
 import { log } from "../logger.js";
 import { formatDuration } from "../utils/format.js";
 import { musicManager, Track } from "./manager.js";
+import { saveGuildVolume } from "../db/guildSettingsStore.js";
 import { createTrackResource, prefetchTrack, type StreamProviderMode } from "./stream.js";
+import { getPlaybackElapsedMs, getPlaybackElapsedSeconds } from "./playbackPosition.js";
 import { startStatusLoop, stopSession, updateSession, forceStatusUpdate } from "../status/sessionManager.js";
 
 function formatPlaybackError(err: unknown, maxLen = 400): string {
@@ -37,7 +39,11 @@ function startPlaybackWatchdog(guildId: string, state: ReturnType<typeof musicMa
       state.lastPlaybackTick = Date.now();
       return;
     }
-    if (Date.now() - state.lastPlaybackTick > 15_000) {
+    const stallTimeoutMs =
+      playerState.status === AudioPlayerStatus.Buffering
+        ? 45_000
+        : 20_000;
+    if (Date.now() - state.lastPlaybackTick > stallTimeoutMs) {
       const err = new Error("Playback stalled (no progress)");
       log.warn("Playback watchdog triggered", { guildId, track: track.title });
       state.player.emit("error", err);
@@ -53,8 +59,20 @@ function stopPlaybackWatchdog(state: ReturnType<typeof musicManager.get>) {
   }
 }
 
-function getElapsedSeconds(startedAt: number | null): number {
-  return startedAt ? Math.max(0, (Date.now() - startedAt) / 1000) : 0;
+function getElapsedMs(state: ReturnType<typeof musicManager.get>): number {
+  return getPlaybackElapsedMs(state);
+}
+
+function getElapsedSeconds(state: ReturnType<typeof musicManager.get>): number {
+  return getPlaybackElapsedSeconds(state);
+}
+
+function getRetrySeekSeconds(track: Track, state: ReturnType<typeof musicManager.get>): number | null {
+  const elapsed = getElapsedSeconds(state);
+  if (track.durationMs > 0 && elapsed * 1000 >= track.durationMs) {
+    return null;
+  }
+  return elapsed >= 1 ? elapsed : 0;
 }
 
 const SHORT_PLAYBACK_MS = 2_000;
@@ -77,8 +95,10 @@ export async function seek(guildId: string, seconds: number): Promise<boolean> {
   try {
     const resource = await createTrackResource(state.current, state.volume, seconds, state.filters);
     state.player.stop();
+    state.playbackBaseOffsetMs = Math.max(0, seconds * 1000);
     state.player.play(resource);
     state.currentStartedAt = Date.now() - (seconds * 1000);
+    state.pausedAt = null;
     return true;
   } catch (err) {
     log.error("Seek failed", err);
@@ -121,14 +141,14 @@ export async function ensureConnection(member: GuildMember, channel?: VoiceBased
       
       if (state.current) {
          log.info("Attempting to auto-reconnect...", { guildId: target.guild.id });
-         try {
-           await new Promise(r => setTimeout(r, 1000));
-           await ensureConnection(member, target);
-           if (state.current && (state.player.state.status === AudioPlayerStatus.Paused || state.player.state.status === AudioPlayerStatus.AutoPaused)) {
-             state.player.unpause();
-           }
-           return;
-         } catch (reconnectErr) {
+          try {
+            await new Promise(r => setTimeout(r, 1000));
+            await ensureConnection(member, target);
+            if (state.current && (state.player.state.status === AudioPlayerStatus.Paused || state.player.state.status === AudioPlayerStatus.AutoPaused)) {
+              resume(target.guild.id);
+            }
+            return;
+          } catch (reconnectErr) {
            log.error("Auto-reconnect failed", reconnectErr);
          }
       }
@@ -169,7 +189,10 @@ export async function playNext(guildId: string) {
       if (!next) {
         state.current = null;
         state.currentStartedAt = null;
+        state.pausedAt = null;
+        state.playbackBaseOffsetMs = 0;
         musicManager.scheduleIdleDisconnect(guildId);
+        void musicManager.saveState(guildId);
         return;
       }
       
@@ -177,6 +200,8 @@ export async function playNext(guildId: string) {
       
       state.current = next;
       state.currentStartedAt = null;
+      state.pausedAt = null;
+      state.playbackBaseOffsetMs = 0;
       if (!state.connection) {
         log.warn("No voice connection when attempting to play", guildId);
         return;
@@ -201,6 +226,8 @@ export async function playNext(guildId: string) {
         const providerMode = options?.providerMode ?? "auto";
         const cliFallbackAttempted = options?.cliFallbackAttempted ?? providerMode === "cli-only";
         const bufferedFallbackAttempted = options?.bufferedFallbackAttempted ?? providerMode === "buffered-download";
+        if (state.pausedAt) state.pausedAt = null;
+        const baseOffsetMs = Math.max(0, (seekSec ?? 0) * 1000);
         const resource = await createTrackResource(track, state.volume, seekSec, state.filters, providerMode);
         
         state.player.removeAllListeners(AudioPlayerStatus.Idle);
@@ -209,11 +236,16 @@ export async function playNext(guildId: string) {
         state.player.removeAllListeners("stateChange");
         state.player.removeAllListeners("error");
         
+        state.playbackBaseOffsetMs = baseOffsetMs;
         state.player.play(resource);
         
         state.player.on(AudioPlayerStatus.Playing, () => {
-          if (!state.currentStartedAt) {
+          if (state.pausedAt && state.currentStartedAt) {
+            state.currentStartedAt += Date.now() - state.pausedAt;
+            state.pausedAt = null;
+          } else if (!state.currentStartedAt) {
             state.currentStartedAt = Date.now() - (seekSec ? seekSec * 1000 : 0);
+            state.pausedAt = null;
           }
 
           log.debug("Player entered Playing state", { guildId, track: track.title });
@@ -239,7 +271,17 @@ export async function playNext(guildId: string) {
         state.player.once(AudioPlayerStatus.Idle, async () => {
           stopPlaybackWatchdog(state);
           state.retryCount = 0;
-          const elapsed = state.currentStartedAt ? Date.now() - state.currentStartedAt : null;
+          const trackWasReplaced = !!state.current?.id && state.current.id !== track.id;
+          if (trackWasReplaced) {
+            log.debug("Current track changed before idle handling; advancing to replacement", {
+              guildId,
+              previousTrack: track.title,
+              replacementTrack: state.current?.title,
+            });
+            await playNext(guildId);
+            return;
+          }
+          const elapsed = state.current ? getElapsedMs(state) : null;
           log.debug("Player entered Idle state", { guildId, track: track.title, elapsedMs: elapsed });
           const shortPlay = elapsed !== null && elapsed < SHORT_PLAYBACK_MS;
 
@@ -251,6 +293,8 @@ export async function playNext(guildId: string) {
             });
             try {
               state.currentStartedAt = null;
+              state.pausedAt = null;
+              state.playbackBaseOffsetMs = 0;
               await playTrack(track, undefined, {
                 providerMode: "cli-only",
                 cliFallbackAttempted: true,
@@ -270,6 +314,8 @@ export async function playNext(guildId: string) {
             });
             try {
               state.currentStartedAt = null;
+              state.pausedAt = null;
+              state.playbackBaseOffsetMs = 0;
               await playTrack(track, undefined, {
                 providerMode: "buffered-download",
                 cliFallbackAttempted: true,
@@ -299,10 +345,21 @@ export async function playNext(guildId: string) {
               track: track.title,
             });
             try {
-              const elapsed = getElapsedSeconds(state.currentStartedAt);
+              const seekSeconds = getRetrySeekSeconds(track, state);
+              if (seekSeconds === null) {
+                log.warn("Retry seek exceeded track duration; moving to next track", { guildId, track: track.title });
+                state.retryCount = 0;
+                state.currentStartedAt = null;
+                state.pausedAt = null;
+                state.playbackBaseOffsetMs = 0;
+                await playNext(guildId);
+                return;
+              }
               await new Promise(r => setTimeout(r, 500));
               state.currentStartedAt = null;
-              await playTrack(track, elapsed >= 1 ? elapsed : undefined, {
+              state.pausedAt = null;
+              state.playbackBaseOffsetMs = 0;
+              await playTrack(track, seekSeconds > 0 ? seekSeconds : undefined, {
                 providerMode: "cli-only",
                 cliFallbackAttempted: true,
                 bufferedFallbackAttempted: false,
@@ -320,6 +377,8 @@ export async function playNext(guildId: string) {
             });
             try {
               state.currentStartedAt = null;
+              state.pausedAt = null;
+              state.playbackBaseOffsetMs = 0;
               await playTrack(track, undefined, {
                 providerMode: "buffered-download",
                 cliFallbackAttempted: true,
@@ -334,11 +393,26 @@ export async function playNext(guildId: string) {
           if (state.retryCount < 3) {
             state.retryCount++;
             log.info(`Retrying playback (${state.retryCount}/3)`, { guildId });
-            const elapsed = getElapsedSeconds(state.currentStartedAt);
+            const seekSeconds = getRetrySeekSeconds(track, state);
+            if (seekSeconds === null) {
+              log.warn("Retry seek exceeded track duration; moving to next track", { guildId, track: track.title });
+              state.retryCount = 0;
+              state.currentStartedAt = null;
+              state.pausedAt = null;
+              state.playbackBaseOffsetMs = 0;
+              await playNext(guildId);
+              return;
+            }
             try {
               await new Promise(r => setTimeout(r, 1000));
               state.currentStartedAt = null;
-              await playTrack(track, elapsed, { providerMode, cliFallbackAttempted, bufferedFallbackAttempted });
+              state.pausedAt = null;
+              state.playbackBaseOffsetMs = 0;
+              await playTrack(track, seekSeconds > 0 ? seekSeconds : undefined, {
+                providerMode,
+                cliFallbackAttempted,
+                bufferedFallbackAttempted,
+              });
             } catch (retryErr) {
               log.error("Retry failed", retryErr);
               void playNext(guildId);
@@ -386,6 +460,8 @@ export async function playNext(guildId: string) {
 export function skip(guildId: string): boolean {
   const state = musicManager.get(guildId);
   if (!state.current) return false;
+  state.pausedAt = null;
+  state.playbackBaseOffsetMs = 0;
   state.player.stop(true);
   void musicManager.saveState(guildId);
   void forceStatusUpdate(guildId);
@@ -398,6 +474,8 @@ export function previousTrack(guildId: string): boolean {
   if (!prev) return false;
   
   state.queue.index = state.queue.index - 1;
+  state.pausedAt = null;
+  state.playbackBaseOffsetMs = 0;
   state.player.stop(true);
   void musicManager.saveState(guildId);
   void forceStatusUpdate(guildId);
@@ -407,6 +485,9 @@ export function previousTrack(guildId: string): boolean {
 export function pause(guildId: string): boolean {
   const state = musicManager.get(guildId);
   const success = state.player.pause();
+  if (success && state.currentStartedAt && !state.pausedAt) {
+    state.pausedAt = Date.now();
+  }
   void musicManager.saveState(guildId);
   void forceStatusUpdate(guildId);
   return success;
@@ -414,7 +495,18 @@ export function pause(guildId: string): boolean {
 
 export function resume(guildId: string): boolean {
   const state = musicManager.get(guildId);
+  if (state.current && state.current.durationMs > 0 && getElapsedMs(state) >= state.current.durationMs) {
+    state.pausedAt = null;
+    state.currentStartedAt = null;
+    state.playbackBaseOffsetMs = 0;
+    state.player.stop(true);
+    return true;
+  }
   const success = state.player.unpause();
+  if (success && state.currentStartedAt && state.pausedAt) {
+    state.currentStartedAt += Date.now() - state.pausedAt;
+    state.pausedAt = null;
+  }
   void musicManager.saveState(guildId);
   void forceStatusUpdate(guildId);
   return success;
@@ -425,6 +517,8 @@ export function stop(guildId: string) {
   stopPlaybackWatchdog(state);
   state.queue.clear();
   state.current = null;
+  state.pausedAt = null;
+  state.playbackBaseOffsetMs = 0;
   state.player.stop(true);
   musicManager.scheduleIdleDisconnect(guildId, 5000);
   stopSession(guildId);
@@ -440,6 +534,7 @@ export function setVolume(guildId: string, volumePercent: number) {
     const resource = (currentState as AudioPlayerPlayingState).resource;
     if (resource?.volume) resource.volume.setVolume(state.volume);
   }
+  void saveGuildVolume(guildId, state.volume);
   void musicManager.saveState(guildId);
   void forceStatusUpdate(guildId);
 }
@@ -473,17 +568,21 @@ export async function replaceTrack(guildId: string, oldId: string, newTrack: Tra
     
     const replaced = state.queue.replace(oldId, newTrack);
     if (replaced) {
+      // Start prefetch now so replacement playback can reuse cache if available.
+      void prefetchTrack(newTrack);
+      // Mark the replacement so the current idle handler skips fallback logic for the old track.
+      state.current = newTrack;
       // We want to replay the current index (which now holds the new track).
-      // playNext() calls queue.next() which increments the index.
-      // So we decrement the index here so that next() brings it back to the current position.
-      
-      // Force shortPlay behavior in playNext so it doesn't interfere with our index manipulation
-      // if loop mode is "track"
-      state.currentStartedAt = Date.now();
+      // playNext() calls queue.next() which increments the index,
+      // so decrement first to keep playback on the replaced slot.
+      state.currentStartedAt = null;
+      state.pausedAt = null;
+      state.playbackBaseOffsetMs = 0;
       
       state.queue.index = state.queue.index - 1;
       
       state.player.stop();
+      void musicManager.saveState(guildId);
       return true;
     }
     return false;
@@ -504,7 +603,7 @@ export async function setFilters(guildId: string, filters: Partial<import("./man
   state.filters = { ...state.filters, ...filters };
   
   if (state.current && state.player.state.status === AudioPlayerStatus.Playing) {
-    const elapsed = state.currentStartedAt ? (Date.now() - state.currentStartedAt) / 1000 : 0;
+    const elapsed = getElapsedSeconds(state);
     await seek(guildId, elapsed);
   }
   

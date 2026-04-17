@@ -1,6 +1,7 @@
 import { Track } from "./manager.js";
 import { extractPlaylistId, extractVideoId, getYoutubeClient } from "./youtube.js";
 import play from "play-dl";
+import { spawnSync } from "child_process";
 
 import { log } from "../logger.js";
 
@@ -76,6 +77,23 @@ interface PlaylistPage {
   getContinuation?: () => Promise<PlaylistPage>;
 }
 
+interface YtDlpPlaylistEntry {
+  id?: string;
+  url?: string;
+  title?: string;
+  duration?: number | string;
+  live_status?: string;
+  is_live?: boolean;
+  was_live?: boolean;
+}
+
+interface YtDlpPlaylistPayload {
+  title?: string;
+  playlist_title?: string;
+  entries?: YtDlpPlaylistEntry[];
+  playlist_count?: number | string;
+}
+
 interface SpotifyArtist {
   name?: string;
 }
@@ -109,6 +127,93 @@ function isSpotifyTrack(value: unknown): value is SpotifyTrack {
 function isSpotifyCollection(value: unknown): value is SpotifyCollection {
   if (!isRecord(value)) return false;
   return (value.type === "playlist" || value.type === "album") && value.fetched_tracks instanceof Map;
+}
+
+function parsePositiveInt(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) return Math.floor(value);
+  if (typeof value === "string") {
+    const parsed = Number.parseInt(value.replace(/[^\d]/g, ""), 10);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return undefined;
+}
+
+function getYtDlpBinaryPath(): string | null {
+  const envPath = process.env.YTDLP_PATH;
+  if (envPath) {
+    const envCheck = spawnSync(envPath, ["--version"], { stdio: "ignore" });
+    if (envCheck.status === 0) return envPath;
+  }
+
+  const defaultCheck = spawnSync("yt-dlp", ["--version"], { stdio: "ignore" });
+  if (defaultCheck.status === 0) return "yt-dlp";
+  return null;
+}
+
+function resolveYoutubePlaylistViaCli(input: string): ResolvePlaylistResult | null {
+  const ytdlpCmd = getYtDlpBinaryPath();
+  if (!ytdlpCmd) return null;
+
+  const result = spawnSync(
+    ytdlpCmd,
+    ["--flat-playlist", "--dump-single-json", "--no-warnings", "--force-ipv4", input],
+    { encoding: "utf8", maxBuffer: 20 * 1024 * 1024 },
+  );
+  if (result.status !== 0 || !result.stdout) {
+    log.warn("yt-dlp playlist fallback failed", { status: result.status, stderr: result.stderr });
+    return null;
+  }
+
+  let payload: YtDlpPlaylistPayload;
+  try {
+    payload = JSON.parse(result.stdout) as YtDlpPlaylistPayload;
+  } catch (err) {
+    log.warn("yt-dlp playlist fallback JSON parse failed", err);
+    return null;
+  }
+
+  const entries = Array.isArray(payload.entries) ? payload.entries : [];
+  const tracks: Track[] = [];
+  let skipped = 0;
+
+  for (const entry of entries) {
+    const liveStatus = String(entry.live_status ?? "").toLowerCase();
+    if (
+      entry.is_live === true ||
+      liveStatus === "is_live" ||
+      liveStatus === "is_upcoming" ||
+      liveStatus === "post_live"
+    ) {
+      skipped++;
+      continue;
+    }
+
+    const videoId = entry.id;
+    const candidateUrl = entry.url;
+    const url = videoId
+      ? `https://www.youtube.com/watch?v=${videoId}`
+      : candidateUrl?.startsWith("http")
+        ? candidateUrl
+        : candidateUrl
+          ? `https://www.youtube.com/watch?v=${candidateUrl}`
+          : null;
+
+    if (!url) {
+      skipped++;
+      continue;
+    }
+
+    const durationSec = parsePositiveInt(entry.duration) ?? 0;
+    tracks.push({
+      title: String(entry.title ?? "Unknown title"),
+      url,
+      durationMs: durationSec * 1000,
+    });
+  }
+
+  const title = payload.title ?? payload.playlist_title;
+  const totalItems = parsePositiveInt(payload.playlist_count) ?? entries.length;
+  return { tracks, title, totalItems, skipped };
 }
 
 export async function resolveYoutubePlaylist(input: string): Promise<ResolvePlaylistResult | null> {
@@ -162,6 +267,15 @@ export async function resolveYoutubePlaylist(input: string): Promise<ResolvePlay
     return { tracks, title, totalItems, skipped };
   } catch (err) {
     log.warn("YouTube playlist resolution failed", err);
+    const cliFallback = resolveYoutubePlaylistViaCli(input);
+    if (cliFallback) {
+      log.info("Resolved YouTube playlist via yt-dlp fallback", {
+        input,
+        trackCount: cliFallback.tracks.length,
+        skipped: cliFallback.skipped,
+      });
+      return cliFallback;
+    }
     return {
       tracks: [],
       skipped: 0,
@@ -260,7 +374,7 @@ export async function resolveTrack(input: string, source: string = "youtube"): P
     const basic = (info.basic_info ?? info) as YouTubeVideoInfo;
     const hasHls = Boolean((info as { streaming_data?: { hls_manifest_url?: string } }).streaming_data?.hls_manifest_url);
     if (basic.is_live || basic.is_live_content || basic.is_low_latency_live_stream || basic.is_upcoming || hasHls) {
-      return { track: null, needsConfirmation: false, message: "Live or upcoming streams are not supported." };
+      log.warn("Track marked as live/upcoming by youtubei; allowing CLI fallback path", { input, videoId });
     }
     const url = `https://www.youtube.com/watch?v=${videoId}`;
     const thumb = basic.thumbnail?.[0]?.url ?? basic.thumbnails?.[0]?.url;

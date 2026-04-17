@@ -65,6 +65,7 @@ describe('stream.ts - yt-dlp handling', () => {
       if (typeof path === 'string' && path.includes('cookies.txt')) return false;
       return false;
     });
+    vi.mocked(fs.statSync).mockReturnValue({ size: 1024 * 1024 } as any);
   });
 
   afterEach(() => {
@@ -95,7 +96,7 @@ describe('stream.ts - yt-dlp handling', () => {
             is_low_latency_live_stream: false,
             is_upcoming: false,
           },
-          download: vi.fn().mockResolvedValue(createMockWebStream(Buffer.from('audio data'))),
+          download: vi.fn().mockImplementation(() => Promise.resolve(createMockWebStream(Buffer.from('audio data')))),
         }),
       };
       vi.mocked(getYoutubeClient).mockResolvedValue(mockYtClient as any);
@@ -142,7 +143,7 @@ describe('stream.ts - yt-dlp handling', () => {
             is_low_latency_live_stream: false,
             is_upcoming: false,
           },
-          download: vi.fn().mockResolvedValue(createMockWebStream(Buffer.from('audio data'))),
+          download: vi.fn().mockImplementation(() => Promise.resolve(createMockWebStream(Buffer.from('audio data')))),
         }),
       };
       vi.mocked(getYoutubeClient).mockResolvedValue(mockYtClient as any);
@@ -188,6 +189,8 @@ describe('stream.ts - yt-dlp handling', () => {
         mime: 'audio/arbitrary',
         lastAccess: new Date().toISOString(),
         createdAt: new Date().toISOString(),
+        lastPlayed: new Date().toISOString(),
+        playCount: 1,
       });
 
       vi.mocked(fs.existsSync).mockImplementation((path: any) => {
@@ -248,7 +251,7 @@ describe('stream.ts - yt-dlp handling', () => {
             is_low_latency_live_stream: false,
             is_upcoming: false,
           },
-          download: vi.fn().mockResolvedValue(createMockWebStream(Buffer.from('audio data'))),
+          download: vi.fn().mockImplementation(() => Promise.resolve(createMockWebStream(Buffer.from('audio data')))),
         }),
       };
       vi.mocked(getYoutubeClient).mockResolvedValue(mockYtClient as any);
@@ -259,6 +262,7 @@ describe('stream.ts - yt-dlp handling', () => {
       expect(result).toBeDefined();
       expect(result.stream).toBeDefined();
     });
+
   });
 
   describe('prefetchTrack', () => {
@@ -378,6 +382,8 @@ describe('stream.ts - yt-dlp handling', () => {
         mime: 'audio/arbitrary',
         lastAccess: new Date().toISOString(),
         createdAt: new Date().toISOString(),
+        lastPlayed: new Date().toISOString(),
+        playCount: 1,
       });
 
       vi.mocked(fs.existsSync).mockImplementation((path: any) => {
@@ -410,6 +416,8 @@ describe('stream.ts - yt-dlp handling', () => {
         mime: 'audio/arbitrary',
         lastAccess: new Date().toISOString(),
         createdAt: new Date().toISOString(),
+        lastPlayed: new Date().toISOString(),
+        playCount: 1,
       });
 
       vi.mocked(fs.existsSync).mockImplementation((path: any) => {
@@ -504,7 +512,7 @@ describe('stream.ts - yt-dlp handling', () => {
             is_low_latency_live_stream: false,
             is_upcoming: false,
           },
-          download: vi.fn().mockResolvedValue(createMockWebStream(Buffer.from('audio data'))),
+          download: vi.fn().mockImplementation(() => Promise.resolve(createMockWebStream(Buffer.alloc(128 * 1024, 1)))),
         }),
       };
       vi.mocked(getYoutubeClient).mockResolvedValue(mockYtClient as any);
@@ -537,7 +545,7 @@ describe('stream.ts - yt-dlp handling', () => {
               is_low_latency_live_stream: false,
               is_upcoming: false,
             },
-            download: vi.fn().mockResolvedValue(createMockWebStream(Buffer.from('audio data'))),
+            download: vi.fn().mockImplementation(() => Promise.resolve(createMockWebStream(Buffer.alloc(128 * 1024, 1)))),
           }),
         };
         vi.mocked(getYoutubeClient).mockResolvedValue(mockYtClient as any);
@@ -578,7 +586,7 @@ describe('stream.ts - yt-dlp handling', () => {
             is_low_latency_live_stream: false,
             is_upcoming: false,
           },
-          download: vi.fn().mockResolvedValue(createMockWebStream(Buffer.from('rick roll audio'))),
+          download: vi.fn().mockImplementation(() => Promise.resolve(createMockWebStream(Buffer.alloc(128 * 1024, 1)))),
         }),
       };
       vi.mocked(getYoutubeClient).mockResolvedValue(mockYtClient as any);
@@ -621,7 +629,7 @@ describe('stream.ts - yt-dlp handling', () => {
             is_low_latency_live_stream: false,
             is_upcoming: false,
           },
-          download: vi.fn().mockResolvedValue(createMockWebStream(Buffer.from('audio data'))),
+          download: vi.fn().mockImplementation(() => Promise.resolve(createMockWebStream(Buffer.from('audio data')))),
         }),
       };
       vi.mocked(getYoutubeClient).mockResolvedValue(mockYtClient as any);

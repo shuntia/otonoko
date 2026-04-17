@@ -14,13 +14,16 @@ import { extractVideoId, getYoutubeClient } from "./youtube.js";
 import { AudioFilters } from "./manager.js";
 
 const CACHE_DIR = "cache";
-const PREBUFFER_BYTES = 32 * 1024;
-const PREBUFFER_TIMEOUT_MS = 500;
+const PREBUFFER_BYTES = 128 * 1024;
+const PREBUFFER_TIMEOUT_MS = 2_000;
 const FIRST_BYTE_TIMEOUT_MS = 8000;
+const PROVIDER_STABILITY_WINDOW_MS = 2000;
+const PREFETCH_WAIT_ON_PLAYBACK_MS = 12_000;
 const YTDLP_NODEJS_MIN_STREAM_BYTES = 96 * 1024;
 const MIN_CACHE_BYTES_SHORT_TRACK = 16 * 1024;
 const MIN_CACHE_DURATION_MS = 15_000;
 const activePrefetches = new Map<string, ChildProcess>();
+const prefetchTasks = new Map<string, Promise<void>>();
 const COOKIES_PATH = path.resolve("cookies.txt");
 let loggedMissingCookies = false;
 let ytDlpNode: YtDlp | null = null;
@@ -162,6 +165,11 @@ async function assertNotLive(url: string) {
   }
 }
 
+function isLiveUnsupportedError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.includes("Live or upcoming streams are not supported.");
+}
+
 async function waitForFirstByte(stream: Readable, timeoutMs: number) {
   await new Promise<void>((resolve, reject) => {
     const readable = stream as Readable;
@@ -175,7 +183,6 @@ async function waitForFirstByte(stream: Readable, timeoutMs: number) {
       if (typeof readable.pause === "function" && typeof readable.unshift === "function") {
         readable.pause();
         readable.unshift(chunk);
-        readable.resume();
       }
       resolve();
     };
@@ -201,11 +208,97 @@ async function waitForFirstByte(stream: Readable, timeoutMs: number) {
   });
 }
 
+function replayCapturedChunks(stream: Readable, captured: Buffer[]) {
+  if (captured.length === 0) return;
+  const readable = stream as Readable;
+  if (typeof readable.pause === "function" && typeof readable.unshift === "function") {
+    readable.pause();
+    for (let i = captured.length - 1; i >= 0; i--) {
+      readable.unshift(captured[i]);
+    }
+  }
+}
+
+async function waitForProviderReadiness(
+  stream: Readable,
+  firstByteTimeoutMs: number,
+  minExpectedBytes: number,
+  stabilityWindowMs = PROVIDER_STABILITY_WINDOW_MS,
+) {
+  if (minExpectedBytes <= 1) {
+    await waitForFirstByte(stream, firstByteTimeoutMs);
+    return;
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const captured: Buffer[] = [];
+    let totalBytes = 0;
+    let readinessTimer: NodeJS.Timeout | null = null;
+    const firstByteTimer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`Provider stream timed out after ${firstByteTimeoutMs}ms (no data)`));
+    }, firstByteTimeoutMs);
+
+    const cleanup = () => {
+      clearTimeout(firstByteTimer);
+      if (readinessTimer) clearTimeout(readinessTimer);
+      stream.off("data", onData);
+      stream.off("error", onError);
+      stream.off("end", onEnd);
+    };
+
+    const succeed = () => {
+      cleanup();
+      replayCapturedChunks(stream, captured);
+      resolve();
+    };
+
+    const onData = (chunk: Buffer) => {
+      const buf = Buffer.from(chunk);
+      captured.push(buf);
+      totalBytes += buf.length;
+
+      if (totalBytes === buf.length) {
+        clearTimeout(firstByteTimer);
+        readinessTimer = setTimeout(() => {
+          succeed();
+        }, Math.max(0, stabilityWindowMs));
+      }
+
+      if (totalBytes >= minExpectedBytes) {
+        succeed();
+      }
+    };
+
+    const onError = (err: Error) => {
+      cleanup();
+      reject(err);
+    };
+
+    const onEnd = () => {
+      cleanup();
+      if (totalBytes < minExpectedBytes) {
+        reject(new Error(`Provider stream ended too early (${totalBytes} bytes, expected >= ${minExpectedBytes})`));
+        return;
+      }
+      replayCapturedChunks(stream, captured);
+      resolve();
+    };
+
+    stream.on("data", onData);
+    stream.once("error", onError);
+    stream.once("end", onEnd);
+  });
+}
+
 function getMinimumExpectedBytes(track: Track): number {
   if (track.durationMs === 0 || track.durationMs >= MIN_CACHE_DURATION_MS) {
     return YTDLP_NODEJS_MIN_STREAM_BYTES;
   }
-  return MIN_CACHE_BYTES_SHORT_TRACK;
+  if (track.durationMs >= 5_000) {
+    return MIN_CACHE_BYTES_SHORT_TRACK;
+  }
+  return 1;
 }
 
 function getFileSizeSafe(filePath: string): number {
@@ -216,44 +309,88 @@ function getFileSizeSafe(filePath: string): number {
   }
 }
 
+function waitForWritableStreamFinish(stream: fs.WriteStream): Promise<void> {
+  if (stream.writableFinished) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    stream.once("finish", () => resolve());
+    stream.once("error", (err) => reject(err));
+  });
+}
+
 export async function prefetchTrack(track: Track): Promise<void> {
   if (!track.url) return;
+  const existingPrefetch = prefetchTasks.get(track.url);
+  if (existingPrefetch) {
+    await existingPrefetch;
+    return;
+  }
+
   const cachePath = getCachePath(track.url);
-  if (fs.existsSync(cachePath)) return;
+  const minExpectedBytes = getMinimumExpectedBytes(track);
+  if (fs.existsSync(cachePath)) {
+    const cachedBytes = getFileSizeSafe(cachePath);
+    if (cachedBytes >= minExpectedBytes) return;
+    log.warn("Ignoring suspiciously short cache before prefetch", {
+      url: track.url,
+      path: cachePath,
+      bytes: cachedBytes,
+      minExpectedBytes,
+    });
+    cleanupTemp(cachePath);
+  }
 
   const tempPath = getTempPath(cachePath, "prefetch");
-  log.debug("Prefetching track", { url: track.url });
+  const task = (async () => {
+    log.debug("Prefetching track", { url: track.url });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const args = buildYtDlpArgs(track.url);
 
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const args = buildYtDlpArgs(track.url);
+        const ytdlpCmd = process.env.YTDLP_PATH || "yt-dlp";
+        const proc = spawn(ytdlpCmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+        activePrefetches.set(track.url, proc);
+        proc.once("error", (e) => reject(e));
 
-      const ytdlpCmd = process.env.YTDLP_PATH || "yt-dlp";
-      const proc = spawn(ytdlpCmd, args, { stdio: ["ignore", "pipe", "pipe"] });
-      activePrefetches.set(track.url, proc);
-      proc.once("error", (e) => reject(e));
+        const fileStream = fs.createWriteStream(tempPath);
+        proc.stdout?.pipe(fileStream);
 
-      const fileStream = fs.createWriteStream(tempPath);
-      proc.stdout?.pipe(fileStream);
+        let stderr = "";
+        proc.stderr?.on("data", (d) => (stderr += d.toString()));
 
-      let stderr = "";
-      proc.stderr?.on("data", (d) => (stderr += d.toString()));
-
-      proc.once("close", async (code) => {
-        activePrefetches.delete(track.url);
-        if (code !== 0) {
-          cleanupTemp(tempPath);
-          reject(new Error(`yt-dlp exited with code ${code}: ${stderr}`));
-        } else {
-          await finalizeCache(track.url, tempPath, cachePath, "prefetch");
-          resolve();
-        }
+        proc.once("close", async (code) => {
+          activePrefetches.delete(track.url);
+          if (code !== 0) {
+            cleanupTemp(tempPath);
+            reject(new Error(`yt-dlp exited with code ${code}: ${stderr}`));
+          } else {
+            try {
+              await waitForWritableStreamFinish(fileStream);
+              const prefetchBytes = getFileSizeSafe(tempPath);
+              if (prefetchBytes < minExpectedBytes) {
+                cleanupTemp(tempPath);
+                reject(new Error(`Prefetch produced too little data (${prefetchBytes} bytes)`));
+                return;
+              }
+              await finalizeCache(track.url, tempPath, cachePath, "prefetch");
+              resolve();
+            } catch (err) {
+              reject(err instanceof Error ? err : new Error(String(err)));
+            }
+          }
+        });
       });
-    });
-  } catch (err) {
-    log.warn("Prefetch failed", { url: track.url, err });
-    cleanupTemp(tempPath);
-  }
+      log.debug("Prefetch complete", { url: track.url });
+    } catch (err) {
+      log.warn("Prefetch failed", { url: track.url, err });
+      cleanupTemp(tempPath);
+    } finally {
+      prefetchTasks.delete(track.url);
+      activePrefetches.delete(track.url);
+    }
+  })();
+
+  prefetchTasks.set(track.url, task);
+  await task;
 }
 
 export async function streamTrack(
@@ -265,35 +402,58 @@ export async function streamTrack(
     throw new Error("Track URL missing");
   }
   const startedAt = Date.now();
+  const minExpectedBytes = getMinimumExpectedBytes(track);
   log.debug("streamTrack start", { url: track.url, seekSec, providerMode });
 
   if (!seekSec && providerMode !== "buffered-download") {
-    if (activePrefetches.has(track.url)) {
-      log.debug("Cancelling active prefetch for immediate playback", { url: track.url });
-      const proc = activePrefetches.get(track.url);
-      proc?.kill();
-      activePrefetches.delete(track.url);
-      await new Promise(r => setTimeout(r, 100));
+    const activePrefetchTask = prefetchTasks.get(track.url);
+    if (activePrefetchTask) {
+      log.debug("Waiting for active prefetch to complete before playback", { url: track.url });
+      await Promise.race([
+        activePrefetchTask,
+        new Promise<void>((resolve) => setTimeout(resolve, PREFETCH_WAIT_ON_PLAYBACK_MS)),
+      ]);
     }
 
     const dbCached = await getCachedAudio(track.url);
     if (dbCached && fs.existsSync(dbCached.filePath)) {
-      log.debug("Filesystem cache hit", { url: track.url, path: dbCached.filePath });
-      const fileStream = fs.createReadStream(dbCached.filePath);
-      const cachedType = Object.values(StreamType).includes(dbCached.mime as StreamType)
-        ? (dbCached.mime as StreamType)
-        : StreamType.Arbitrary;
-      return {
-        stream: prebufferReadable(fileStream, PREBUFFER_BYTES, PREBUFFER_TIMEOUT_MS),
-        type: cachedType,
-        skipProbe: false,
-      };
+      const cachedBytes = getFileSizeSafe(dbCached.filePath);
+      if (cachedBytes < minExpectedBytes) {
+        log.warn("Ignoring suspiciously short cache file", {
+          url: track.url,
+          path: dbCached.filePath,
+          bytes: cachedBytes,
+          minExpectedBytes,
+        });
+        cleanupTemp(dbCached.filePath);
+      } else {
+        log.debug("Filesystem cache hit", { url: track.url, path: dbCached.filePath, bytes: cachedBytes });
+        const fileStream = fs.createReadStream(dbCached.filePath);
+        const cachedType = Object.values(StreamType).includes(dbCached.mime as StreamType)
+          ? (dbCached.mime as StreamType)
+          : StreamType.Arbitrary;
+        return {
+          stream: prebufferReadable(fileStream, PREBUFFER_BYTES, PREBUFFER_TIMEOUT_MS),
+          type: cachedType,
+          skipProbe: false,
+        };
+      }
     }
   }
 
   try {
     if (seekSec && providerMode !== "buffered-download") {
-      await assertNotLive(track.url);
+      if (providerMode === "auto") {
+        try {
+          await assertNotLive(track.url);
+        } catch (err) {
+          if (isLiveUnsupportedError(err) && checkYtDlpBinary()) {
+            log.warn("Live/upcoming stream detected; forcing yt-dlp CLI fallback", { url: track.url });
+            return streamTrack(track, undefined, "cli-only");
+          }
+          throw err;
+        }
+      }
       const cli = await ytDlpStream(track.url, seekSec);
       await waitForFirstByte(cli.stream, FIRST_BYTE_TIMEOUT_MS);
       return {
@@ -302,10 +462,19 @@ export async function streamTrack(
       };
     }
 
-    await assertNotLive(track.url);
+    if (providerMode === "auto") {
+      try {
+        await assertNotLive(track.url);
+      } catch (err) {
+        if (isLiveUnsupportedError(err) && checkYtDlpBinary()) {
+          log.warn("Live/upcoming stream detected; forcing yt-dlp CLI fallback", { url: track.url });
+          return streamTrack(track, undefined, "cli-only");
+        }
+        throw err;
+      }
+    }
 
     const cachePath = getCachePath(track.url);
-    const minExpectedBytes = getMinimumExpectedBytes(track);
 
     if (providerMode === "buffered-download") {
       if (fs.existsSync(cachePath)) {
@@ -349,7 +518,7 @@ export async function streamTrack(
                   name: "yt-dlp",
                   create: async () => {
                     const tempPath = getTempPath(cachePath, "cli.tmp");
-                    return ytDlpStreamAndCache(track.url, tempPath, cachePath);
+                    return ytDlpStreamAndCache(track.url, tempPath, cachePath, minExpectedBytes);
                   },
                 }]
               : []),
@@ -360,7 +529,7 @@ export async function streamTrack(
                   name: "ytdlp-nodejs",
                   create: async () => {
                     const tempPath = getTempPath(cachePath, "node.tmp");
-                    return ytDlpNodeStreamAndCache(track.url, tempPath, cachePath);
+                    return ytDlpNodeStreamAndCache(track.url, tempPath, cachePath, minExpectedBytes);
                   },
                 }]
               : []),
@@ -369,7 +538,7 @@ export async function streamTrack(
                   name: "yt-dlp",
                   create: async () => {
                     const tempPath = getTempPath(cachePath, "cli.tmp");
-                    return ytDlpStreamAndCache(track.url, tempPath, cachePath);
+                    return ytDlpStreamAndCache(track.url, tempPath, cachePath, minExpectedBytes);
                   },
                 }]
               : []),
@@ -377,7 +546,7 @@ export async function streamTrack(
               name: "youtubei",
               create: async () => {
                 const tempPath = getTempPath(cachePath, "yt.tmp");
-                return youtubeiStreamAndCache(track.url, tempPath, cachePath);
+                return youtubeiStreamAndCache(track.url, tempPath, cachePath, minExpectedBytes);
               },
             },
           ];
@@ -394,7 +563,8 @@ export async function streamTrack(
     for (const provider of providers) {
       try {
         const streamResult = await provider.create();
-        await waitForFirstByte(streamResult.stream, FIRST_BYTE_TIMEOUT_MS);
+        await waitForProviderReadiness(streamResult.stream, FIRST_BYTE_TIMEOUT_MS, minExpectedBytes);
+        log.debug("Stream provider selected", { provider: provider.name, url: track.url });
         return {
           ...streamResult,
           stream: prebufferReadable(streamResult.stream, PREBUFFER_BYTES, PREBUFFER_TIMEOUT_MS),
@@ -569,6 +739,8 @@ function prebufferReadable(
     playback.destroy(err);
   });
 
+  source.resume();
+
   return playback;
 }
 
@@ -607,7 +779,8 @@ async function ytDlpStream(
 async function ytDlpStreamAndCache(
   url: string,
   tempPath: string,
-  finalPath: string
+  finalPath: string,
+  minExpectedBytes: number,
 ): Promise<StreamResult> {
   return new Promise((resolve, _reject) => {
     const args = buildYtDlpArgs(url);
@@ -618,33 +791,65 @@ async function ytDlpStreamAndCache(
     
     const ytdlpCmd = process.env.YTDLP_PATH || "yt-dlp";
     const proc = spawn(ytdlpCmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const stdout = proc.stdout;
+    if (!stdout) {
+      playback.destroy(new Error("yt-dlp did not provide a stdout stream"));
+      resolve({ stream: playback, type: StreamType.Arbitrary, skipProbe: true });
+      return;
+    }
     proc.once("error", (e) => {
       playback.emit("error", e);
     });
 
     let stderr = "";
     let totalBytes = 0;
+    let sourceEnded = false;
+    let sourceShort = false;
+    let procClosed = false;
+    let procCode: number | null = null;
+    let finalized = false;
+
+    const maybeFinalize = async () => {
+      if (finalized || !sourceEnded || !procClosed || procCode !== 0 || sourceShort) return;
+      finalized = true;
+      await waitForWritableStreamFinish(fileStream);
+      await finalizeCache(url, tempPath, finalPath, "yt-dlp");
+    };
+    const runFinalize = () => {
+      void maybeFinalize().catch((err) => {
+        cleanupTemp(tempPath);
+        playback.destroy(err instanceof Error ? err : new Error(String(err)));
+      });
+    };
+
     proc.stderr?.on("data", (d) => (stderr += d.toString()));
-    proc.stdout?.on("data", (chunk: Buffer) => {
+    stdout.on("data", (chunk: Buffer) => {
       totalBytes += chunk.length;
     });
+    stdout.once("end", () => {
+      sourceEnded = true;
+      if (totalBytes < minExpectedBytes) {
+        sourceShort = true;
+        cleanupTemp(tempPath);
+        playback.destroy(new Error(`[yt-dlp] stream ended too early (${totalBytes} bytes)`));
+        return;
+      }
+      playback.end();
+      runFinalize();
+    });
     
-    proc.stdout?.pipe(fileStream);
-    proc.stdout?.pipe(playback);
+    stdout.pipe(fileStream);
+    stdout.pipe(playback, { end: false });
 
-    proc.once("close", async (code) => {
+    proc.once("close", (code) => {
+      procClosed = true;
+      procCode = code;
       if (code !== 0) {
         log.error("yt-dlp exited with code", code, stderr);
         cleanupTemp(tempPath);
         playback.emit('error', new Error(`yt-dlp exited with code ${code}: ${stderr}`));
-      } else {
-        if (totalBytes < MIN_CACHE_BYTES_SHORT_TRACK) {
-          log.warn("yt-dlp stream too short to cache", { url, totalBytes });
-          cleanupTemp(tempPath);
-          return;
-        }
-        await finalizeCache(url, tempPath, finalPath, "yt-dlp");
       }
+      runFinalize();
     });
 
     resolve({ stream: playback, type: StreamType.Arbitrary, skipProbe: true });
@@ -655,6 +860,7 @@ async function ytDlpNodeStreamAndCache(
   url: string,
   tempPath: string,
   finalPath: string,
+  minExpectedBytes: number,
 ): Promise<StreamResult> {
   const client = getYtDlpNode();
   if (!client) {
@@ -687,7 +893,7 @@ async function ytDlpNodeStreamAndCache(
   playback.on("drain", () => underlying.resume());
   underlying.on("end", async () => {
     log.debug("ytdlp-nodejs underlying stream ended", { url, totalBytes: underlyingBytes });
-    if (underlyingBytes < YTDLP_NODEJS_MIN_STREAM_BYTES) {
+    if (underlyingBytes < minExpectedBytes) {
       ytDlpNodeUnavailable = true;
       const shortErr = new Error(
         `[ytdlp-nodejs] stream ended unexpectedly early (${underlyingBytes} bytes)`,
@@ -704,9 +910,15 @@ async function ytDlpNodeStreamAndCache(
 
     playback.end();
     if (fileStreamOpen) {
-      fileStreamOpen = false;
-      fileStream.end();
-      await finalizeCache(url, tempPath, finalPath, "ytdlp-nodejs");
+      try {
+        fileStreamOpen = false;
+        fileStream.end();
+        await waitForWritableStreamFinish(fileStream);
+        await finalizeCache(url, tempPath, finalPath, "ytdlp-nodejs");
+      } catch (err) {
+        cleanupTemp(tempPath);
+        playback.destroy(err instanceof Error ? err : new Error(String(err)));
+      }
     }
   });
   underlying.on("error", (err: Error) => {
@@ -809,6 +1021,7 @@ async function youtubeiStreamAndCache(
   url: string,
   tempPath: string,
   finalPath: string,
+  minExpectedBytes: number,
 ): Promise<StreamResult> {
   const videoId = extractVideoId(url);
   if (!videoId) {
@@ -834,18 +1047,34 @@ async function youtubeiStreamAndCache(
   const fileStream = fs.createWriteStream(tempPath);
   const playback = new PassThrough();
   playback.on("error", () => {});
+  let totalBytes = 0;
 
+  nodeStream.on("data", (chunk: Buffer) => {
+    totalBytes += chunk.length;
+  });
   nodeStream.on("error", (err) => {
     cleanupTemp(tempPath);
     playback.emit("error", err);
   });
 
   nodeStream.on("end", async () => {
-    await finalizeCache(url, tempPath, finalPath, "youtubei");
+    if (totalBytes < minExpectedBytes) {
+      cleanupTemp(tempPath);
+      playback.destroy(new Error(`[youtubei] stream ended too early (${totalBytes} bytes)`));
+      return;
+    }
+    try {
+      playback.end();
+      await waitForWritableStreamFinish(fileStream);
+      await finalizeCache(url, tempPath, finalPath, "youtubei");
+    } catch (err) {
+      cleanupTemp(tempPath);
+      playback.destroy(err instanceof Error ? err : new Error(String(err)));
+    }
   });
 
   nodeStream.pipe(fileStream);
-  nodeStream.pipe(playback);
+  nodeStream.pipe(playback, { end: false });
 
   return { stream: playback, type: StreamType.Arbitrary, skipProbe: true };
 }

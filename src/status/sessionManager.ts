@@ -1,6 +1,8 @@
 import { ActionRowBuilder, ButtonBuilder, ButtonStyle, Client, EmbedBuilder } from "discord.js";
 import { AudioPlayerStatus } from "@discordjs/voice";
 import { GuildMusicState } from "../music/manager.js";
+import { musicManager } from "../music/manager.js";
+import { getPlaybackElapsedMs } from "../music/playbackPosition.js";
 import { formatDuration } from "../utils/format.js";
 import { updateStatus, clearStatus, setStatusClient, getClient } from "./statusManager.js";
 import { log } from "../logger.js";
@@ -18,11 +20,27 @@ interface Session {
 
 const sessions = new Map<string, Session>();
 let clientSet = false;
+let lastPresencePlaying: boolean | null = null;
+
+function updatePlaybackPresence() {
+  const client = getClient();
+  if (!client?.user) return;
+  const isPlaying = [...sessions.keys()].some((guildId) => {
+    const state = musicManager.get(guildId);
+    return state.player.state.status === AudioPlayerStatus.Playing;
+  });
+  if (lastPresencePlaying === isPlaying) return;
+  lastPresencePlaying = isPlaying;
+  client.user.setPresence({
+    activities: [{ name: isPlaying ? "playing music" : "not playing" }],
+  });
+}
 
 export function attachStatusClient(client: Client) {
   if (!clientSet) {
     setStatusClient(client);
     clientSet = true;
+    updatePlaybackPresence();
   }
 }
 
@@ -90,6 +108,7 @@ export function stopSession(guildId: string) {
   if (session.interval) clearInterval(session.interval);
   if (session.textChannelId) void clearStatus(session.textChannelId);
   sessions.delete(guildId);
+  updatePlaybackPresence();
   log.debug("Session stopped", {
     guildId,
     voiceChannelId: session.voiceChannelId,
@@ -106,6 +125,7 @@ export function startStatusLoop(guildId: string, state: GuildMusicState) {
   const tick = async () => {
     const payload = await buildStatusPayload(state);
     await updateStatus(session.textChannelId!, payload);
+    updatePlaybackPresence();
   };
   session.interval = setInterval(tick, 1000);
   void tick();
@@ -114,9 +134,10 @@ export function startStatusLoop(guildId: string, state: GuildMusicState) {
 export async function forceStatusUpdate(guildId: string) {
   const session = sessions.get(guildId);
   if (!session || !session.textChannelId) return;
-  const state = (await import("../music/manager.js")).musicManager.get(guildId);
+  const state = musicManager.get(guildId);
   const payload = await buildStatusPayload(state);
   await updateStatus(session.textChannelId, payload);
+  updatePlaybackPresence();
 }
 
 function createProgressBar(current: number, total: number, size = 15): string {
@@ -129,8 +150,7 @@ function createProgressBar(current: number, total: number, size = 15): string {
 
 async function buildStatusPayload(state: GuildMusicState) {
   const current = state.current;
-  const elapsed =
-    state.currentStartedAt && current ? Math.max(0, Date.now() - state.currentStartedAt) : 0;
+  const elapsed = current ? getPlaybackElapsedMs(state) : 0;
   const dur = current?.durationMs ?? 0;
   const progressStr = current ? `${formatDuration(elapsed)} / ${formatDuration(dur)}` : "N/A";
   const progressBar = current ? createProgressBar(elapsed, dur) : "";
