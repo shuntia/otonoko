@@ -99,9 +99,12 @@ export class MusicManager {
       guildId,
       current: state.current,
       queue: state.queue.all,
+      queueIndex: state.queue.index,
       history: state.history,
       loop: state.loop,
       volume: state.volume,
+      filters: state.filters,
+      sessionToken: state.sessionToken,
       playerStatus: state.player.state.status,
       paused: state.player.state.status === AudioPlayerStatus.Paused,
       lastTextChannelId: state.lastTextChannelId,
@@ -130,9 +133,14 @@ export class MusicManager {
 
         const state = this.get(data.guildId);
         state.queue.enqueueMany(data.queue);
+        if (typeof data.queueIndex === "number") {
+          state.queue.index = Math.max(-1, Math.min(data.queueIndex, state.queue.length - 1));
+        }
         state.history = data.history;
         state.loop = data.loop;
+        state.filters = data.filters ?? {};
         state.volume = data.volume;
+        if (data.sessionToken) state.sessionToken = data.sessionToken;
         this.volumeByGuild.set(data.guildId, data.volume);
         await saveGuildVolume(data.guildId, data.volume);
         state.lastTextChannelId = data.lastTextChannelId;
@@ -144,18 +152,36 @@ export class MusicManager {
 
         if (shouldResumeCurrent && data.current) {
           const currentTrack = data.current;
-          const currentIdx = state.queue.all.findIndex(
-            (track) =>
-              (currentTrack.id && track.id === currentTrack.id) ||
-              track.url === currentTrack.url,
-          );
+          let currentIdx =
+            typeof data.queueIndex === "number" &&
+            data.queueIndex >= 0 &&
+            data.queueIndex < state.queue.length &&
+            (state.queue.all[data.queueIndex].id === currentTrack.id ||
+              state.queue.all[data.queueIndex].url === currentTrack.url)
+              ? data.queueIndex
+              : state.queue.all.findIndex(
+                  (track) =>
+                    (currentTrack.id && track.id === currentTrack.id) ||
+                    track.url === currentTrack.url,
+                );
           if (currentIdx === -1) {
             state.queue.unshift(currentTrack);
-          } else {
-            state.queue.index = currentIdx - 1;
+            currentIdx = 0;
           }
+          state.queue.index = currentIdx - 1;
           state.current = currentTrack;
         } else {
+          const lastCurrent = data.current;
+          if (typeof data.queueIndex !== "number" && lastCurrent) {
+            const lastIdx = state.queue.all.findIndex(
+              (track) =>
+                (lastCurrent.id && track.id === lastCurrent.id) ||
+                track.url === lastCurrent.url,
+            );
+            if (lastIdx !== -1) {
+              state.queue.index = lastIdx;
+            }
+          }
           state.current = null;
         }
 

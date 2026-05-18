@@ -1,13 +1,16 @@
 import { getDb } from "./client.js";
-import { Track, LoopMode } from "../music/manager.js";
+import { Track, LoopMode, AudioFilters } from "../music/manager.js";
 
 export interface QueueState {
   guildId: string;
   current: Track | null;
   queue: Track[];
+  queueIndex?: number;
   history: Track[];
   loop: LoopMode;
   volume: number;
+  filters?: AudioFilters;
+  sessionToken?: string;
   playerStatus?: string;
   paused: boolean;
   lastTextChannelId: string | null;
