@@ -153,11 +153,30 @@ function buildYtDlpOptions(seekSec?: number) {
   return options;
 }
 
+function isYoutubeParserError(err: unknown): boolean {
+  const message = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+  return (
+    message.includes("InnertubeError") ||
+    message.includes("ParsingError") ||
+    message.includes("SingleColumnWatchNextResults") ||
+    message.includes("Cannot read properties of null (reading 'as')")
+  );
+}
+
 async function assertNotLive(url: string) {
   const videoId = extractVideoId(url);
   if (!videoId) return;
   const yt = await getYoutubeClient();
-  const info = await yt.getInfo(videoId);
+  let info: Awaited<ReturnType<typeof yt.getInfo>>;
+  try {
+    info = await yt.getInfo(videoId);
+  } catch (err) {
+    if (isYoutubeParserError(err)) {
+      log.warn("youtubei parser failed during live check; skipping strict live precheck", { url, videoId, err });
+      return;
+    }
+    throw err;
+  }
   const basic = info.basic_info;
   const hasHls = Boolean((info as { streaming_data?: { hls_manifest_url?: string } }).streaming_data?.hls_manifest_url);
   if (basic?.is_live || basic?.is_live_content || basic?.is_low_latency_live_stream || basic?.is_upcoming || hasHls) {

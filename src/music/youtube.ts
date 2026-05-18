@@ -10,10 +10,10 @@ export function getYoutubeClient() {
         if (mod && typeof mod.setLevel === "function" && mod.Level) {
           try { mod.setLevel(mod.Level.ERROR); } catch (e) {}
         }
-        return mod.Innertube.create({ cache: new mod.UniversalCache(false), client_type: ClientType.IOS });
+        return mod.Innertube.create({ cache: new mod.UniversalCache(false), client_type: ClientType.WEB });
       } catch (e) {
         // Fallback to static imports if dynamic import fails
-        return Innertube.create({ cache: new UniversalCache(false), client_type: ClientType.IOS });
+        return Innertube.create({ cache: new UniversalCache(false), client_type: ClientType.WEB });
       }
     })();
   }
