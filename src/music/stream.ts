@@ -42,28 +42,36 @@ function getCachePath(url: string): string {
   return path.join(CACHE_DIR, hash);
 }
 
+function canExecuteYtDlp(binaryPath: string): boolean {
+  try {
+    const result = spawnSync(binaryPath, ["--version"], { stdio: "ignore" });
+    return Boolean(result && result.status === 0);
+  } catch {
+    return false;
+  }
+}
+
 function checkYtDlpBinary(): boolean {
   if (ytDlpBinaryChecked) return ytDlpBinaryAvailable;
   ytDlpBinaryChecked = true;
   const envPath = process.env.YTDLP_PATH;
   if (envPath) {
-    ytDlpBinaryAvailable = fs.existsSync(envPath);
-    if (ytDlpBinaryAvailable) return true;
-  }
-
-  try {
-    const result = spawnSync("yt-dlp", ["--version"], { stdio: "ignore" });
-    if (result && result.status === 0) {
+    if (canExecuteYtDlp(envPath)) {
       ytDlpBinaryAvailable = true;
       return true;
     }
-  } catch (e) {
-    // ignore and try common locations
+    log.warn("Configured YTDLP_PATH is not executable; ignoring", { path: envPath });
+    delete process.env.YTDLP_PATH;
+  }
+
+  if (canExecuteYtDlp("yt-dlp")) {
+    ytDlpBinaryAvailable = true;
+    return true;
   }
 
   const commonPaths = ["/usr/bin/yt-dlp", "/bin/yt-dlp", "/usr/local/bin/yt-dlp", "/sbin/yt-dlp"];
   for (const p of commonPaths) {
-    if (fs.existsSync(p)) {
+    if (canExecuteYtDlp(p)) {
       // export so other code can pick it up
       process.env.YTDLP_PATH = p;
       ytDlpBinaryAvailable = true;
