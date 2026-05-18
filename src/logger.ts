@@ -14,15 +14,21 @@ const levelOrder: Record<Level, number> = {
 
 let currentLevel: Level = (process.env.LOG_LEVEL as Level) ?? "info";
 let bugLogStream: fs.WriteStream | null = null;
+let bugModeWriteFailed = false;
 
 export function enableBugMode() {
   if (bugLogStream) return;
   const logPath = path.join(process.cwd(), "bug.log");
-  bugLogStream = fs.createWriteStream(logPath, { flags: "a" });
+  const stream = fs.createWriteStream(logPath, { flags: "a" });
+  stream.on("error", (err) => {
+    handleBugStreamFailure("Bug log stream error", err);
+  });
+  bugLogStream = stream;
+  bugModeWriteFailed = false;
   currentLevel = "debug";
   const ts = new Date().toISOString();
   const msg = `[${ts}] [INFO] Bug reporting enabled. Logging to ${logPath}\n`;
-  bugLogStream.write(msg);
+  safeWriteBugLog(msg);
   console.log(msg.trim());
 }
 
@@ -47,6 +53,29 @@ function emit(level: Level, args: unknown[]) {
   // File output
   if (bugLogStream) {
     const formatted = format(...args);
-    bugLogStream.write(`[${ts}] [${level.toUpperCase()}] ${formatted}\n`);
+    safeWriteBugLog(`[${ts}] [${level.toUpperCase()}] ${formatted}\n`);
   }
+}
+
+function safeWriteBugLog(message: string) {
+  if (!bugLogStream) return;
+  try {
+    bugLogStream.write(message);
+  } catch (err) {
+    handleBugStreamFailure("Bug log write failed", err);
+  }
+}
+
+function handleBugStreamFailure(context: string, err: unknown) {
+  if (bugModeWriteFailed) return;
+  bugModeWriteFailed = true;
+  const stream = bugLogStream;
+  bugLogStream = null;
+  if (stream) {
+    stream.removeAllListeners("error");
+    stream.destroy();
+  }
+  const message = err instanceof Error ? err.message : String(err);
+  const ts = new Date().toISOString();
+  console.error(`[${ts}] [WARN] ${context}. Disabling bug.log writes. ${message}`);
 }
