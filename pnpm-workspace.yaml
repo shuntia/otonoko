@@ -1,3 +1,10 @@
+allowBuilds:
+  '@discordjs/opus': set this to true or false
+  better-sqlite3: set this to true or false
+  esbuild: set this to true or false
+  sqlite3: set this to true or false
+  ytdlp-nodejs: set this to true or false
+
 onlyBuiltDependencies:
   - '@discordjs/opus'
   - better-sqlite3
